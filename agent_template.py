@@ -35,6 +35,14 @@ rt.enable_logging()
 client = DetectiveClient()
 
 
+@dataclass(frozen=True)
+class EvidenceRecord:
+    clue_id: str
+    text: str
+    source: str
+    location_id: str
+
+
 @dataclass
 class InvestigationTracker:
     """Deterministic memory for facts the LLM should not have to remember."""
@@ -48,7 +56,7 @@ class InvestigationTracker:
     exits_by_location: dict[str, set[str]] = field(default_factory=dict)
     characters_by_location: dict[str, set[str]] = field(default_factory=dict)
     searchable_locations: set[str] = field(default_factory=set)
-    clues: dict[str, str] = field(default_factory=dict)
+    clues: dict[str, EvidenceRecord] = field(default_factory=dict)
     inventory: set[str] = field(default_factory=set)
     presentations: set[tuple[str, str]] = field(default_factory=set)
 
@@ -76,6 +84,14 @@ class InvestigationTracker:
         if observation.searchable:
             self.searchable_locations.add(location_id)
 
+    def record_clue(self, clue, source: str) -> None:
+        self.clues[clue.clue_id] = EvidenceRecord(
+            clue_id=clue.clue_id,
+            text=clue.text,
+            source=source,
+            location_id=self.current_location,
+        )
+
     def summary(self, actions_remaining: int) -> str:
         unvisited = sorted(self.all_locations - self.visited)
         unsearched = sorted(self.searchable_locations - self.searched)
@@ -91,7 +107,9 @@ class InvestigationTracker:
             if characters
         ]
         clue_lines = [
-            f"  [{clue_id}] {text}" for clue_id, text in sorted(self.clues.items())
+            f"  [{record.clue_id}] {record.text} "
+            f"(source: {record.source}; location: {record.location_id})"
+            for record in sorted(self.clues.values(), key=lambda item: item.clue_id)
         ]
         presentation_lines = [
             f"  {character_id} <- {ref_id}"
@@ -110,12 +128,13 @@ class InvestigationTracker:
             f"Inventory         : {sorted(self.inventory) or 'none'}\n"
             f"Known map:\n{chr(10).join(map_lines) or '  none'}\n"
             f"Known characters:\n{chr(10).join(character_lines) or '  none'}\n"
-            f"Collected clues:\n{chr(10).join(clue_lines) or '  none'}\n"
+            f"Evidence board:\n{chr(10).join(clue_lines) or '  none'}\n"
             f"Presentations tried:\n{chr(10).join(presentation_lines) or '  none'}"
         )
 
 
 tracker = InvestigationTracker()
+critic_enabled = False
 
 
 # ── Tools (game actions) ──────────────────────────────────────────────────────
@@ -172,7 +191,7 @@ def search_location() -> str:
         if evidence.item_id:
             tracker.inventory.add(evidence.item_id)
         for clue in evidence.yields:
-            tracker.clues[clue.clue_id] = clue.text
+            tracker.record_clue(clue, source=f"search:{evidence.name}")
     if not obs.found:
         return f"Nothing found here. Actions left: {obs.actions_remaining}"
     lines = []
@@ -210,7 +229,7 @@ def interview_character(character_id: str) -> str:
         return f"Interview rejected: {exc}"
     tracker.interviewed.add(character_id)
     for clue in obs.said:
-        tracker.clues[clue.clue_id] = clue.text
+        tracker.record_clue(clue, source=f"interview:{character_id}")
     if not obs.said:
         return f"{obs.name} has nothing to say. Actions left: {obs.actions_remaining}"
     lines = [f"{obs.name} says:"]
@@ -250,7 +269,7 @@ def present_to_character(character_id: str, ref_id: str) -> str:
         return f"Present rejected: {exc}"
     tracker.presentations.add(attempt)
     for clue in obs.revealed:
-        tracker.clues[clue.clue_id] = clue.text
+        tracker.record_clue(clue, source=f"present:{character_id}<-{ref_id}")
     if not obs.accepted or not obs.revealed:
         return f"Character was not persuaded by '{ref_id}'. Actions left: {obs.actions_remaining}"
     lines = ["Testimony unlocked:"]
@@ -316,12 +335,42 @@ DetectiveAgent = rt.agent_node(
     system_message=_prompts["detective_agent"]["system_message"],
 )
 
+CaseCritic = rt.agent_node(
+    "Case Critic",
+    llm=rt.llm.OpenAILLM("gpt-5.2"),
+    system_message=_prompts["case_critic"]["system_message"],
+)
+
 OutputParser = rt.agent_node(
     "Output Parser",
     output_schema=CommitDecision,
     llm=rt.llm.OpenAILLM("gpt-5.2"),
     system_message=_prompts["output_parser"]["system_message"],
 )
+
+
+def validate_decision(decision: CommitDecision, briefing: object) -> list[str]:
+    """Return commit-blocking errors for IDs the server would score as invalid."""
+    errors = []
+    cast_ids = {character.id for character in briefing.cast}
+    means_ids = {means.id for means in briefing.means_options}
+    note_ids = [note.clue_id for note in decision.evidence_notes]
+
+    if decision.culprit_id not in cast_ids:
+        errors.append(f"Unknown culprit_id: {decision.culprit_id}")
+    if decision.means_id not in means_ids:
+        errors.append(f"Unknown means_id: {decision.means_id}")
+    if len(note_ids) != len(set(note_ids)):
+        errors.append("Duplicate clue IDs in evidence_notes")
+
+    unknown_clues = sorted(set(note_ids) - set(tracker.clues))
+    if unknown_clues:
+        errors.append(f"Evidence notes contain uncollected clues: {unknown_clues}")
+
+    explanation_words = len(decision.process_explanation.split())
+    if explanation_words > 140:
+        errors.append(f"Process explanation is {explanation_words} words; maximum is 140")
+    return errors
 
 
 # ── Flow entry point ──────────────────────────────────────────────────────────
@@ -382,9 +431,36 @@ async def run_investigation(seed_id: str = "S002") -> dict:
         f"Begin your investigation now."
     )
 
-    result = await rt.call(DetectiveAgent, prompt)
-    result = await rt.call(OutputParser, str(result.text))
+    detective_result = await rt.call(DetectiveAgent, prompt)
+
+    handoff = str(detective_result.text)
+    if critic_enabled:
+        critic_prompt = (
+            f"ORIGINAL BRIEFING\n{b.synopsis}\n\n"
+            f"VALID CULPRIT IDS\n{cast_lines}\n\n"
+            f"VALID MEANS IDS\n{means_lines}\n\n"
+            f"TIMELINE CLAIMS\n{step_lines}\n\n"
+            f"DETECTIVE HANDOFF\n{handoff}\n\n"
+            f"AUTHORITATIVE INVESTIGATION STATE\n"
+            f"{tracker.summary(client.actions_remaining)}\n\n"
+            f"Review the collected case without taking more actions and produce the revised handoff."
+        )
+        critic_result = await rt.call(CaseCritic, critic_prompt)
+        handoff = str(critic_result.text)
+
+    parser_prompt = (
+        f"{handoff}\n\n"
+        f"AUTHORITATIVE COLLECTED CLUE IDS: {sorted(tracker.clues)}\n"
+        f"VALID CULPRIT IDS: {sorted(character.id for character in b.cast)}\n"
+        f"VALID MEANS IDS: {sorted(means.id for means in b.means_options)}"
+    )
+    result = await rt.call(OutputParser, parser_prompt)
     decision: CommitDecision = result.structured
+
+    validation_errors = validate_decision(decision, b)
+    if validation_errors:
+        formatted = "\n".join(f"- {error}" for error in validation_errors)
+        raise RuntimeError(f"Commit blocked by local validation:\n{formatted}")
 
     result = client.commit(
         culprit_id=decision.culprit_id,
@@ -425,9 +501,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Allow a hidden H... seed, whose submission is irreversible.",
     )
+    parser.add_argument(
+        "--critic",
+        action="store_true",
+        help="Run an additional read-only case review before committing.",
+    )
     args = parser.parse_args()
 
     if args.seed.upper().startswith("H") and not args.allow_hidden:
         parser.error("Hidden seeds require --allow-hidden")
 
+    critic_enabled = args.critic
     result = flow.invoke(args.seed.upper())
