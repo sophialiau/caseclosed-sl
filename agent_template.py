@@ -11,6 +11,7 @@ a structured answer when it's confident.
 
 import yaml
 import railtracks as rt
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from pydantic import BaseModel
@@ -126,15 +127,32 @@ class InvestigationTracker:
             f"Interviewed       : {sorted(self.interviewed)}\n"
             f"Not interviewed   : {missing_characters or 'none'}\n"
             f"Inventory         : {sorted(self.inventory) or 'none'}\n"
+            f"Presentation refs : use collected clue IDs and inventory item IDs\n"
             f"Known map:\n{chr(10).join(map_lines) or '  none'}\n"
             f"Known characters:\n{chr(10).join(character_lines) or '  none'}\n"
             f"Evidence board:\n{chr(10).join(clue_lines) or '  none'}\n"
             f"Presentations tried:\n{chr(10).join(presentation_lines) or '  none'}"
         )
 
+    def progress_key(self) -> tuple:
+        """Compact marker used to detect whether a continuation made progress."""
+        return (
+            len(self.clues),
+            tuple(sorted(self.visited)),
+            tuple(sorted(self.searched)),
+            tuple(sorted(self.interviewed)),
+            tuple(sorted(self.presentations)),
+        )
+
+    def location_for_character(self, character_id: str) -> str | None:
+        """Return the known location for a character, if discovered."""
+        for location_id, characters in self.characters_by_location.items():
+            if character_id in characters:
+                return location_id
+        return None
+
 
 tracker = InvestigationTracker()
-critic_enabled = False
 
 
 # ── Tools (game actions) ──────────────────────────────────────────────────────
@@ -289,6 +307,260 @@ def get_investigation_summary() -> str:
     return tracker.summary(client.actions_remaining)
 
 
+def find_path(start: str, goal: str) -> list[str] | None:
+    """Find a path through the currently known map."""
+    if start == goal:
+        return []
+
+    queue = deque([(start, [])])
+    seen = {start}
+    while queue:
+        location, path = queue.popleft()
+        for next_location in sorted(tracker.exits_by_location.get(location, set())):
+            if next_location in seen:
+                continue
+            next_path = [*path, next_location]
+            if next_location == goal:
+                return next_path
+            seen.add(next_location)
+            queue.append((next_location, next_path))
+    return None
+
+
+def auto_move_to(location_id: str, log: list[str]) -> bool:
+    """Move directly to an adjacent location, recording tracker state."""
+    if tracker.current_location == location_id:
+        return True
+    if location_id not in tracker.exits_by_location.get(tracker.current_location, set()):
+        return False
+
+    try:
+        obs = client.move(location_id)
+    except GameError as exc:
+        log.append(f"Move blocked to {location_id}: {exc}")
+        return False
+
+    tracker.record_location(obs)
+    log.append(
+        f"Moved to {obs.location_id}; characters={obs.characters_present or 'none'}; "
+        f"searchable={obs.searchable}; actions={obs.actions_remaining}"
+    )
+    return True
+
+
+def auto_follow_path(path: list[str], log: list[str]) -> bool:
+    """Follow a known path, stopping if a move is blocked."""
+    for location_id in path:
+        if not auto_move_to(location_id, log):
+            return False
+    return True
+
+
+def auto_search_current(log: list[str]) -> bool:
+    """Search current location when useful."""
+    if tracker.current_location not in tracker.searchable_locations:
+        return False
+    if tracker.current_location in tracker.searched:
+        return False
+
+    try:
+        obs = client.search()
+    except GameError as exc:
+        log.append(f"Search blocked at {tracker.current_location}: {exc}")
+        return False
+
+    tracker.searched.add(tracker.current_location)
+    found_bits = []
+    for evidence in obs.found:
+        if evidence.item_id:
+            tracker.inventory.add(evidence.item_id)
+        clue_ids = []
+        for clue in evidence.yields:
+            tracker.record_clue(clue, source=f"search:{evidence.name}")
+            clue_ids.append(clue.clue_id)
+        found_bits.append(f"{evidence.name}({', '.join(clue_ids) or 'no clues'})")
+    log.append(
+        f"Searched {tracker.current_location}: {found_bits or 'nothing'}; "
+        f"actions={obs.actions_remaining}"
+    )
+    return True
+
+
+def auto_interview_here(log: list[str]) -> bool:
+    """Interview every not-yet-interviewed character at the current location."""
+    progressed = False
+    for character_id in sorted(tracker.characters_by_location.get(tracker.current_location, set())):
+        if character_id in tracker.interviewed:
+            continue
+        try:
+            obs = client.interview(character_id)
+        except GameError as exc:
+            log.append(f"Interview blocked for {character_id}: {exc}")
+            continue
+
+        tracker.interviewed.add(character_id)
+        for clue in obs.said:
+            tracker.record_clue(clue, source=f"interview:{character_id}")
+        log.append(
+            f"Interviewed {character_id}: {[clue.clue_id for clue in obs.said] or 'nothing'}; "
+            f"actions={obs.actions_remaining}"
+        )
+        progressed = True
+    return progressed
+
+
+def auto_primary_sweep(reserve_actions: int = 18, max_steps: int = 80) -> str:
+    """Deterministically collect cheap search/interview evidence before LLM reasoning."""
+    log = ["AUTO PRIMARY SWEEP START"]
+    blocked: dict[str, tuple[str, ...]] = {}
+
+    for _ in range(max_steps):
+        if client.actions_remaining <= reserve_actions:
+            break
+
+        progressed = False
+        progressed = auto_search_current(log) or progressed
+        progressed = auto_interview_here(log) or progressed
+        if progressed:
+            continue
+
+        inventory_key = tuple(sorted(tracker.inventory))
+        reachable_unvisited = []
+        for location in sorted(tracker.all_locations - tracker.visited):
+            if blocked.get(location) == inventory_key:
+                continue
+            path = find_path(tracker.current_location, location)
+            if path is not None:
+                reachable_unvisited.append((len(path), location, path))
+
+        if reachable_unvisited:
+            _, location, path = min(reachable_unvisited)
+            if not auto_follow_path(path, log):
+                blocked[location] = inventory_key
+            continue
+
+        reachable_unsearched = []
+        for location in sorted(tracker.searchable_locations - tracker.searched):
+            path = find_path(tracker.current_location, location)
+            if path is not None:
+                reachable_unsearched.append((len(path), location, path))
+
+        if reachable_unsearched:
+            _, _, path = min(reachable_unsearched)
+            auto_follow_path(path, log)
+            continue
+
+        reachable_missing_interviews = []
+        for location, characters in tracker.characters_by_location.items():
+            if not (characters - tracker.interviewed):
+                continue
+            path = find_path(tracker.current_location, location)
+            if path is not None:
+                reachable_missing_interviews.append((len(path), location, path))
+
+        if reachable_missing_interviews:
+            _, _, path = min(reachable_missing_interviews)
+            auto_follow_path(path, log)
+            continue
+
+        break
+
+    log.append("AUTO PRIMARY SWEEP END")
+    log.append(tracker.summary(client.actions_remaining))
+    return "\n".join(log)
+
+
+def character_terms(character) -> set[str]:
+    """Names/initials used to connect clues to a character."""
+    name = character.name.lower()
+    parts = [part.strip(".,'\"()[]") for part in name.split() if part.strip(".,'\"()[]")]
+    terms = set(parts)
+    if parts:
+        terms.add(name)
+        terms.add(".".join(part[0] for part in parts if part) + ".")
+        terms.add("".join(part[0] for part in parts if part))
+    return {term for term in terms if len(term) > 1}
+
+
+def clue_mentions_character(record: EvidenceRecord, terms: set[str]) -> bool:
+    """Return whether a clue text appears connected to a character."""
+    text = record.text.lower()
+    compact = text.replace(" ", "")
+    return any(term in text or term.replace(".", "") in compact for term in terms)
+
+
+def auto_present(character_id: str, ref_id: str, log: list[str]) -> bool:
+    """Present a collected ref to a character if possible."""
+    if ref_id not in tracker.clues and ref_id not in tracker.inventory:
+        return False
+    attempt = (character_id, ref_id)
+    if attempt in tracker.presentations:
+        return False
+
+    location_id = tracker.location_for_character(character_id)
+    if not location_id:
+        return False
+    path = find_path(tracker.current_location, location_id)
+    if path is None:
+        return False
+    if not auto_follow_path(path, log):
+        return False
+
+    try:
+        obs = client.present(character_id, ref_id)
+    except GameError as exc:
+        log.append(f"Present blocked {character_id} <- {ref_id}: {exc}")
+        return False
+
+    tracker.presentations.add(attempt)
+    for clue in obs.revealed:
+        tracker.record_clue(clue, source=f"present:{character_id}<-{ref_id}")
+    log.append(
+        f"Presented {character_id} <- {ref_id}: "
+        f"{[clue.clue_id for clue in obs.revealed] or 'no unlock'}; "
+        f"actions={obs.actions_remaining}"
+    )
+    return bool(obs.revealed)
+
+
+def auto_targeted_presentations(briefing, max_attempts: int = 12, reserve_actions: int = 8) -> str:
+    """Try high-signal guarded-testimony unlocks without brute-forcing every pair."""
+    log = ["AUTO TARGETED PRESENTATIONS START"]
+    attempts = 0
+
+    for character in briefing.cast:
+        if attempts >= max_attempts or client.actions_remaining <= reserve_actions:
+            break
+        character_id = character.id
+        if not tracker.location_for_character(character_id):
+            continue
+
+        refs: list[str] = []
+        refs.extend(sorted(tracker.inventory))
+        terms = character_terms(character)
+        refs.extend(
+            record.clue_id
+            for record in sorted(tracker.clues.values(), key=lambda item: item.clue_id)
+            if clue_mentions_character(record, terms)
+        )
+
+        seen_refs = set()
+        for ref_id in refs:
+            if attempts >= max_attempts or client.actions_remaining <= reserve_actions:
+                break
+            if ref_id in seen_refs:
+                continue
+            seen_refs.add(ref_id)
+            if (character_id, ref_id) in tracker.presentations:
+                continue
+            auto_present(character_id, ref_id, log)
+            attempts += 1
+
+    log.append("AUTO TARGETED PRESENTATIONS END")
+    log.append(tracker.summary(client.actions_remaining))
+    return "\n".join(log)
+
+
 # ── Commit decision schema ────────────────────────────────────────────────────
 
 class EvidenceNote(BaseModel):
@@ -318,6 +590,30 @@ class CommitDecision(BaseModel):
     Target ~120 words."""
 
 
+def word_count(text: str) -> int:
+    """Return a simple whitespace word count."""
+    return len(text.split())
+
+
+def limit_words(text: str, max_words: int = 140) -> str:
+    """Trim text to max_words while keeping a readable ending."""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+
+    clipped = " ".join(words[:max_words]).rstrip(" ,;:-")
+    if clipped and clipped[-1] not in ".!?":
+        clipped += "."
+    return clipped
+
+
+def enforce_word_limits(decision: CommitDecision, max_words: int = 140) -> None:
+    """Apply hard word-count guardrails before local validation and commit."""
+    for note in decision.evidence_notes:
+        note.note = limit_words(note.note, max_words)
+    decision.process_explanation = limit_words(decision.process_explanation, max_words)
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 llm = rt.llm.OpenAILLM("gpt-5-nano")
@@ -333,12 +629,6 @@ DetectiveAgent = rt.agent_node(
     ],
     llm=llm,
     system_message=_prompts["detective_agent"]["system_message"],
-)
-
-CaseCritic = rt.agent_node(
-    "Case Critic",
-    llm=rt.llm.OpenAILLM("gpt-5.2"),
-    system_message=_prompts["case_critic"]["system_message"],
 )
 
 OutputParser = rt.agent_node(
@@ -367,7 +657,15 @@ def validate_decision(decision: CommitDecision, briefing: object) -> list[str]:
     if unknown_clues:
         errors.append(f"Evidence notes contain uncollected clues: {unknown_clues}")
 
-    explanation_words = len(decision.process_explanation.split())
+    long_notes = [
+        f"{note.clue_id} ({word_count(note.note)} words)"
+        for note in decision.evidence_notes
+        if word_count(note.note) > 140
+    ]
+    if long_notes:
+        errors.append(f"Evidence notes exceed 140 words: {long_notes}")
+
+    explanation_words = word_count(decision.process_explanation)
     if explanation_words > 140:
         errors.append(f"Process explanation is {explanation_words} words; maximum is 140")
     return errors
@@ -399,6 +697,9 @@ async def run_investigation(seed_id: str = "S002") -> dict:
     means_lines = "\n".join(f"  {m.id}  ({m.name})" for m in b.means_options)
     location_lines = "\n".join(f"  {loc.id} — {loc.name}" for loc in b.locations)
 
+    auto_sweep_log = auto_primary_sweep(reserve_actions=16)
+    auto_presentation_log = auto_targeted_presentations(b)
+
     prompt = (
         f"═══ CASE BRIEFING ═══\n"
         f"{b.synopsis}\n\n"
@@ -410,12 +711,12 @@ async def run_investigation(seed_id: str = "S002") -> dict:
         f"{means_lines}\n\n"
         f"Your process_explanation must address each of these claims:\n"
         f"{step_lines}\n\n"
-        f"══ LOCATIONS (visit and search all) ══\n"
-        f"There are {len(b.locations)} locations. You must visit every one.\n"
+        f"══ LOCATIONS (known map targets) ══\n"
+        f"There are {len(b.locations)} locations. Complete a cheap primary sweep before committing.\n"
         f"Movement is EXIT-BASED — you can only move to rooms listed in your current exits.\n"
         f"To reach a distant room, navigate hop-by-hop; check your exits after each move.\n"
         f"{location_lines}\n\n"
-        f"══ CAST (find every character) ══\n"
+        f"══ CAST (possible suspects and witnesses) ══\n"
         f"There are {len(b.cast)} characters. Each is stationary in one room.\n"
         f"You will discover WHERE each character is by visiting rooms and reading\n"
         f"the 'Characters here' line in the move result. Track who you find:\n"
@@ -424,38 +725,46 @@ async def run_investigation(seed_id: str = "S002") -> dict:
         f"{initial_obs}\n\n"
         f"Start your mental map now:\n"
         f"  Current location exits (listed above) — record them before your first move.\n\n"
+        f"═══ AUTO PRIMARY SWEEP ALREADY COMPLETED ═══\n"
+        f"{auto_sweep_log}\n\n"
         f"═══ YOUR TASK ═══\n"
-        f"Investigate fully, then commit. Write one evidence note per clue you found (what it\n"
-        f"proves in context, ~120 words each), then a short holistic narrative with NO clue IDs\n"
-        f"as your process_explanation (~120 words).\n\n"
+        f"The cheap search/interview sweep has already been done for you. Build the cheapest\n"
+        f"strong case from the current evidence board. Use tools only for missing cheap work\n"
+        f"or for a small budget of 3-6 targeted presentations if actions allow: present\n"
+        f"inventory item IDs first to the character named by, owning, signing, accessing, or\n"
+        f"contradicted by that item. Do not revisit searched rooms, re-interview characters,\n"
+        f"or exhaust speculative presentations once culprit, means, motive, opportunity, and\n"
+        f"timeline are supported.\n"
+        f"Write one evidence note per clue you found (what it proves in context, ~120 words\n"
+        f"each), then a short holistic narrative with NO clue IDs as your process_explanation\n"
+        f"(~120 words).\n\n"
         f"Begin your investigation now."
     )
 
-    detective_result = await rt.call(DetectiveAgent, prompt)
+    handoffs: list[str] = [
+        "AUTOMATED INVESTIGATION HANDOFF:\n"
+        "The primary sweep and targeted presentation pass are complete. Use the "
+        "authoritative evidence board and timeline claims to choose the best culprit_id, "
+        "means_id, evidence notes, and process explanation.\n\n"
+        f"{auto_sweep_log}\n\n{auto_presentation_log}"
+    ]
 
-    handoff = str(detective_result.text)
-    if critic_enabled:
-        critic_prompt = (
-            f"ORIGINAL BRIEFING\n{b.synopsis}\n\n"
-            f"VALID CULPRIT IDS\n{cast_lines}\n\n"
-            f"VALID MEANS IDS\n{means_lines}\n\n"
-            f"TIMELINE CLAIMS\n{step_lines}\n\n"
-            f"DETECTIVE HANDOFF\n{handoff}\n\n"
-            f"AUTHORITATIVE INVESTIGATION STATE\n"
-            f"{tracker.summary(client.actions_remaining)}\n\n"
-            f"Review the collected case without taking more actions and produce the revised handoff."
-        )
-        critic_result = await rt.call(CaseCritic, critic_prompt)
-        handoff = str(critic_result.text)
-
+    evidence_lines = "\n".join(
+        f"[{record.clue_id}] {record.text} "
+        f"(source: {record.source}; location: {record.location_id})"
+        for record in sorted(tracker.clues.values(), key=lambda item: item.clue_id)
+    )
     parser_prompt = (
-        f"{handoff}\n\n"
+        f"{chr(10).join(handoffs)}\n\n"
+        f"AUTHORITATIVE EVIDENCE BOARD:\n{evidence_lines or 'none'}\n\n"
+        f"TIMELINE CLAIMS:\n{step_lines}\n\n"
         f"AUTHORITATIVE COLLECTED CLUE IDS: {sorted(tracker.clues)}\n"
         f"VALID CULPRIT IDS: {sorted(character.id for character in b.cast)}\n"
         f"VALID MEANS IDS: {sorted(means.id for means in b.means_options)}"
     )
     result = await rt.call(OutputParser, parser_prompt)
     decision: CommitDecision = result.structured
+    enforce_word_limits(decision)
 
     validation_errors = validate_decision(decision, b)
     if validation_errors:
@@ -501,15 +810,9 @@ if __name__ == "__main__":
         action="store_true",
         help="Allow a hidden H... seed, whose submission is irreversible.",
     )
-    parser.add_argument(
-        "--critic",
-        action="store_true",
-        help="Run an additional read-only case review before committing.",
-    )
     args = parser.parse_args()
 
     if args.seed.upper().startswith("H") and not args.allow_hidden:
         parser.error("Hidden seeds require --allow-hidden")
 
-    critic_enabled = args.critic
     result = flow.invoke(args.seed.upper())
